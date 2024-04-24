@@ -206,7 +206,7 @@ class Profile(contextlib.ContextDecorator):
     def time(self):
         """Measures and returns the current time, synchronizing CUDA operations if `cuda` is True."""
         if self.cuda:
-            torch.cuda.synchronize(self.device)
+            torch.cuda.synchronize(self.device) # synch all threads to confirm all threads is finished
         return time.time()
 
 
@@ -593,7 +593,7 @@ def check_amp(model):
         return a.shape == b.shape and torch.allclose(a, b, atol=0.1)  # close to 10% absolute tolerance
 
     prefix = colorstr("AMP: ")
-    device = next(model.parameters()).device  # get model device
+    device = next(model.parameters()).device  # get model device, next(iterator) to get the first
     if device.type in ("cpu", "mps"):
         return False  # AMP only used on CUDA devices
     f = ROOT / "data" / "images" / "bus.jpg"  # image to check

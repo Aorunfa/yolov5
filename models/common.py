@@ -781,9 +781,9 @@ class AutoShape(nn.Module):
         self.pt = not self.dmb or model.pt  # PyTorch model
         self.model = model.eval()
         if self.pt:
-            m = self.model.model.model[-1] if self.dmb else self.model.model[-1]  # Detect()
+            m = self.model.model.model[-1] if self.dmb else self.model.model[-1]  # Detect() last detect layer
             m.inplace = False  # Detect.inplace=False for safe multithread inference
-            m.export = True  # do not output loss values
+            m.export = True    # do not output loss values
 
     def _apply(self, fn):
         """
@@ -816,7 +816,7 @@ class AutoShape(nn.Module):
         #   torch:           = torch.zeros(16,3,320,640)  # BCHW (scaled to size=640, 0-1 values)
         #   multiple:        = [Image.open('image1.jpg'), Image.open('image2.jpg'), ...]  # list of images
 
-        dt = (Profile(), Profile(), Profile())
+        dt = (Profile(), Profile(), Profile()) # 同步torch线程环境
         with dt[0]:
             if isinstance(size, int):  # expand
                 size = (size, size)
@@ -846,11 +846,11 @@ class AutoShape(nn.Module):
                 shape1.append([int(y * g) for y in s])
                 ims[i] = im if im.data.contiguous else np.ascontiguousarray(im)  # update
             shape1 = [make_divisible(x, self.stride) for x in np.array(shape1).max(0)]  # inf shape
-            x = [letterbox(im, shape1, auto=False)[0] for im in ims]  # pad
+            x = [letterbox(im, shape1, auto=False)[0] for im in ims]       # pad
             x = np.ascontiguousarray(np.array(x).transpose((0, 3, 1, 2)))  # stack and BHWC to BCHW
-            x = torch.from_numpy(x).to(p.device).type_as(p) / 255  # uint8 to fp16/32
+            x = torch.from_numpy(x).to(p.device).type_as(p) / 255          # uint8 to fp16/32
 
-        with amp.autocast(autocast):
+        with amp.autocast(autocast): # setup amp opt in follow forward
             # Inference
             with dt[1]:
                 y = self.model(x, augment=augment)  # forward
@@ -867,7 +867,7 @@ class AutoShape(nn.Module):
                     max_det=self.max_det,
                 )  # NMS
                 for i in range(n):
-                    scale_boxes(shape1, y[i][:, :4], shape0[i])
+                    scale_boxes(shape1, y[i][:, :4], shape0[i]) # rescale to the real size
 
             return Detections(ims, y, files, dt, self.names, x.shape)
 

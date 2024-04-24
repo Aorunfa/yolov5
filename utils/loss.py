@@ -56,9 +56,9 @@ class FocalLoss(nn.Module):
         # loss *= self.alpha * (1.000001 - p_t) ** self.gamma  # non-zero power for gradient stability
 
         # TF implementation https://github.com/tensorflow/addons/blob/v0.7.1/tensorflow_addons/losses/focal_loss.py
-        pred_prob = torch.sigmoid(pred)  # prob from logits
-        p_t = true * pred_prob + (1 - true) * (1 - pred_prob)
-        alpha_factor = true * self.alpha + (1 - true) * (1 - self.alpha)
+        pred_prob = torch.sigmoid(pred)                       # prob from logits
+        p_t = true * pred_prob + (1 - true) * (1 - pred_prob) # for multi class, is a vetor, e.g t = 1, 0, 0, p = 0.9, 0.1, 0.1, for every label, prob is 0.9, 0.9, 0.9
+        alpha_factor = true * self.alpha + (1 - true) * (1 - self.alpha)  # pos 1 : neg others = 0.25 : 0.75, when a class occure, its weight alpha will be decrease
         modulating_factor = (1.0 - p_t) ** self.gamma
         loss *= alpha_factor * modulating_factor
 
@@ -121,7 +121,8 @@ class ComputeLoss:
         if g > 0:
             BCEcls, BCEobj = FocalLoss(BCEcls, g), FocalLoss(BCEobj, g)
 
-        m = de_parallel(model).model[-1]  # Detect() module
+        m = de_parallel(model).model[-1]  # Detect() module, to get the last
+        
         self.balance = {3: [4.0, 1.0, 0.4]}.get(m.nl, [4.0, 1.0, 0.25, 0.06, 0.02])  # P3-P7
         self.ssi = list(m.stride).index(16) if autobalance else 0  # stride 16 index
         self.BCEcls, self.BCEobj, self.gr, self.hyp, self.autobalance = BCEcls, BCEobj, 1.0, h, autobalance
@@ -130,16 +131,18 @@ class ComputeLoss:
         self.nl = m.nl  # number of layers
         self.anchors = m.anchors
         self.device = device
-
-    def __call__(self, p, targets):  # predictions, targets
+    def __call__(self, p, targets):  # predictions, targets ; p: [shape[4, 3, gride x, gride y, 85] × 3], first 3 for anchors , last 3 for detect layers
         """Performs forward pass, calculating class, box, and object loss for given predictions and targets."""
         lcls = torch.zeros(1, device=self.device)  # class loss
         lbox = torch.zeros(1, device=self.device)  # box loss
-        lobj = torch.zeros(1, device=self.device)  # object loss
-        tcls, tbox, indices, anchors = self.build_targets(p, targets)  # targets
+        lobj = torch.zeros(1, device=self.device)  # object loss // confidence 
+        
+        # get pos targets; indices include imgidx, anchoridx, gj, gi (positive sample after offset)
+        tcls, tbox, indices, anchors = self.build_targets(p, targets)  
 
-        # Losses
-        for i, pi in enumerate(p):  # layer index, layer predictions
+        # Losses -----------------------caculate for every 3 detect layers--------------
+        for i, pi in enumerate(p):
+
             b, a, gj, gi = indices[i]  # image, anchor, gridy, gridx
             tobj = torch.zeros(pi.shape[:4], dtype=pi.dtype, device=self.device)  # target obj
 
@@ -148,7 +151,7 @@ class ComputeLoss:
                 # pxy, pwh, _, pcls = pi[b, a, gj, gi].tensor_split((2, 4, 5), dim=1)  # faster, requires torch 1.8.0
                 pxy, pwh, _, pcls = pi[b, a, gj, gi].split((2, 2, 1, self.nc), 1)  # target-subset of predictions
 
-                # Regression
+                # Regression - box
                 pxy = pxy.sigmoid() * 2 - 0.5
                 pwh = (pwh.sigmoid() * 2) ** 2 * anchors[i]
                 pbox = torch.cat((pxy, pwh), 1)  # predicted box
@@ -160,13 +163,13 @@ class ComputeLoss:
                 if self.sort_obj_iou:
                     j = iou.argsort()
                     b, a, gj, gi, iou = b[j], a[j], gj[j], gi[j], iou[j]
-                if self.gr < 1:
+                if self.gr < 1: # object rate with iou
                     iou = (1.0 - self.gr) + self.gr * iou
                 tobj[b, a, gj, gi] = iou  # iou ratio
 
                 # Classification
-                if self.nc > 1:  # cls loss (only if multiple classes)
-                    t = torch.full_like(pcls, self.cn, device=self.device)  # targets
+                if self.nc > 1: # cls loss (only if multiple classes)
+                    t = torch.full_like(pcls, self.cn, device=self.device)  # targets, init with negative sample weights
                     t[range(n), tcls[i]] = self.cp
                     lcls += self.BCEcls(pcls, t)  # BCE
 
@@ -174,8 +177,8 @@ class ComputeLoss:
                 # with open('targets.txt', 'a') as file:
                 #     [file.write('%11.5g ' * 4 % tuple(x) + '\n') for x in torch.cat((txy[i], twh[i]), 1)]
 
-            obji = self.BCEobj(pi[..., 4], tobj)
-            lobj += obji * self.balance[i]  # obj loss
+            obji = self.BCEobj(pi[..., 4], tobj) # a anchor -  cx cy w h conf class-80
+            lobj += obji * self.balance[i]  # obj loss -- 放大小样本和大样本的置信度权重
             if self.autobalance:
                 self.balance[i] = self.balance[i] * 0.9999 + 0.0001 / obji.detach().item()
 
@@ -186,18 +189,19 @@ class ComputeLoss:
         lcls *= self.hyp["cls"]
         bs = tobj.shape[0]  # batch size
 
-        return (lbox + lobj + lcls) * bs, torch.cat((lbox, lobj, lcls)).detach()
+        return (lbox + lobj + lcls) * bs, torch.cat((lbox, lobj, lcls)).detach() # loss normalize with batchsize,  with grad, no grad
 
     def build_targets(self, p, targets):
         """Prepares model targets from input targets (image,class,x,y,w,h) for loss computation, returning class, box,
         indices, and anchors.
         """
-        na, nt = self.na, targets.shape[0]  # number of anchors, targets
-        tcls, tbox, indices, anch = [], [], [], []
-        gain = torch.ones(7, device=self.device)  # normalized to gridspace gain
-        ai = torch.arange(na, device=self.device).float().view(na, 1).repeat(1, nt)  # same as .repeat_interleave(nt)
-        targets = torch.cat((targets.repeat(na, 1, 1), ai[..., None]), 2)  # append anchor indices
-
+        na, nt = self.na, targets.shape[0]  # number of anchors, targets // targets = [img_idx, class, cx, cy, w, h]
+        tcls, tbox, indices, anch = [], [], [], [] # indices：用来存储第几张图片，当前层的第几个anchor，以及当前层grid的下标
+        gain = torch.ones(7, device=self.device)   # normalized to gridspace gain save as [b, cls, lx, ly, lw, lh, anchor_idx]
+        ai = torch.arange(na, device=self.device).float().view(na, 1).repeat(1, nt)  # same as .repeat_interleave(nt) [3, nt]
+        targets = torch.cat((targets.repeat(na, 1, 1), ai[..., None]), 2)  # add anchor indices in -1 axis [..., anchor_idx]
+        
+        # 预定义偏移量 --  to get posive targats 上下左右和自己
         g = 0.5  # bias
         off = (
             torch.tensor(
@@ -214,40 +218,53 @@ class ComputeLoss:
             * g
         )  # offsets
 
-        for i in range(self.nl):
-            anchors, shape = self.anchors[i], p[i].shape
+        # scran all 3 detection layers
+        for i in range(self.nl): # num layers for detect
+            anchors, shape = self.anchors[i], p[i].shape  # anchors =  anchors_raw / m.stride.view(-1, 1, 1), 与下采样倍数同比放缩
             gain[2:6] = torch.tensor(shape)[[3, 2, 3, 2]]  # xyxy gain
 
             # Match targets to anchors
-            t = targets * gain  # shape(3,n,7)
+            t = targets * gain  # to rematch gridespcae, update cx cy w h to stride size
             if nt:
-                # Matches
-                r = t[..., 4:6] / anchors[:, None]  # wh ratio
-                j = torch.max(r, 1 / r).max(2)[0] < self.hyp["anchor_t"]  # compare
+                # anchor filter: to find which anchor to regress the target -------------------------
+                r = t[..., 4:6] / anchors[:, None]  # wh ratio , None add in one axis
+                j = torch.max(r, 1 / r).max(2)[0] < self.hyp["anchor_t"]  # compare, r and 1/r to match upsize and downsize 
                 # j = wh_iou(anchors, t[:, 4:6]) > model.hyp['iou_t']  # iou(3,n)=wh_iou(anchors(3,2), gwh(n,2))
-                t = t[j]  # filter
+                t = t[j]
 
-                # Offsets
-                gxy = t[:, 2:4]  # grid xy
-                gxi = gain[[2, 3]] - gxy  # inverse
-                j, k = ((gxy % 1 < g) & (gxy > 1)).T
-                l, m = ((gxi % 1 < g) & (gxi > 1)).T
-                j = torch.stack((torch.ones_like(j), j, k, l, m))
-                t = t.repeat((5, 1, 1))[j]
-                offsets = (torch.zeros_like(gxy)[None] + off[:, None])[j]
+                # pos offset: to find which posive sample can be extend and make offset -----------------------
+                gxy = t[:, 2:4]  # cx cy
+                gxi = gain[[2, 3]] - gxy  # inverse                   
+                l, d = ((gxy % 1 < g) & (gxy > 1)).T  
+                r, u = ((gxi % 1 < g) & (gxi > 1)).T
+                """
+                no need for center n // 0.5 == 0, e.g  (1.5, 1.5)
+                y ^
+                  |
+                  |_____>x 
+                x % 1 < g and x > 1 , to find left-offset idx (y down-offset)
+
+                x <------
+                        |
+                        |y
+                x % 1 < g and x > 1, to find right-offset idx (y up-offset)     
+                """  
+                j = torch.stack((torch.ones_like(l), l, d, r, u))  #shape [5, nt] ; torch.ones_like(j) all True like j ; torch.stack add axis in first            
+                t = t.repeat((5, 1, 1))[j] # repeat : [[.] [.] [.] [.] [.] ] shape(5, nt, 7)
+                offsets = (torch.zeros_like(gxy)[None] + off[:, None])[j] # boasdert as t
             else:
                 t = targets[0]
                 offsets = 0
 
-            # Define
+            # Define --- to split each label
             bc, gxy, gwh, a = t.chunk(4, 1)  # (image, class), grid xy, grid wh, anchors
-            a, (b, c) = a.long().view(-1), bc.long().T  # anchors, image, class
-            gij = (gxy - offsets).long()
+            a, (b, c) = a.long().view(-1), bc.long().T  # anchors, image, class --- 1d 
+            gij = (gxy - offsets).long() # only keep int val, gij is the cell's left-top points
             gi, gj = gij.T  # grid indices
 
             # Append
-            indices.append((b, a, gj.clamp_(0, shape[2] - 1), gi.clamp_(0, shape[3] - 1)))  # image, anchor, grid
-            tbox.append(torch.cat((gxy - gij, gwh), 1))  # box
+            indices.append((b, a, gj.clamp_(0, shape[2] - 1), gi.clamp_(0, shape[3] - 1)))  # image, anchor, extend grid cx, cy
+            tbox.append(torch.cat((gxy - gij, gwh), 1))  # box // cxcy 相对cell左上角偏移量
             anch.append(anchors[a])  # anchors
             tcls.append(c)  # class
 

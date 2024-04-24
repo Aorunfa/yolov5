@@ -109,6 +109,7 @@ class Loggers:
             prefix = colorstr("Comet: ")
             s = f"{prefix}run 'pip install comet_ml' to automatically track and visualize YOLOv5 🚀 runs in Comet"
             self.logger.info(s)
+        
         # TensorBoard
         s = self.save_dir
         if "tb" in self.include and not self.opt.evolve:

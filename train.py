@@ -141,7 +141,7 @@ def train(hyp, opt, device, callbacks):
         yaml_save(save_dir / "hyp.yaml", hyp)
         yaml_save(save_dir / "opt.yaml", vars(opt))
 
-    # Loggers
+    # Loggers ------ setup callback -----------------------------------------------------------
     data_dict = None
     if RANK in {-1, 0}:
         include_loggers = list(LOGGERS)
@@ -172,31 +172,36 @@ def train(hyp, opt, device, callbacks):
     plots = not evolve and not opt.noplots  # create plots
     cuda = device.type != "cpu"
     init_seeds(opt.seed + 1 + RANK, deterministic=True)
-    with torch_distributed_zero_first(LOCAL_RANK):
-        data_dict = data_dict or check_dataset(data)  # check if None
+    
+    # data info cofig
+    with torch_distributed_zero_first(LOCAL_RANK):    # to confirm all DDP process is setup
+        data_dict = data_dict or check_dataset(data)  # check if None    
     train_path, val_path = data_dict["train"], data_dict["val"]
     nc = 1 if single_cls else int(data_dict["nc"])  # number of classes
     names = {0: "item"} if single_cls and len(data_dict["names"]) != 1 else data_dict["names"]  # class names
     is_coco = isinstance(val_path, str) and val_path.endswith("coco/val2017.txt")  # COCO dataset
 
-    # Model
+    # Model: load model , pretrained weight , exclude certain module , safe load intersec weights
     check_suffix(weights, ".pt")  # check weights
     pretrained = weights.endswith(".pt")
     if pretrained:
         with torch_distributed_zero_first(LOCAL_RANK):
-            weights = attempt_download(weights)  # download if not found locally
+            weights = attempt_download(weights)         # download if not found locally
         ckpt = torch.load(weights, map_location="cpu")  # load checkpoint to CPU to avoid CUDA memory leak
         model = Model(cfg or ckpt["model"].yaml, ch=3, nc=nc, anchors=hyp.get("anchors")).to(device)  # create
         exclude = ["anchor"] if (cfg or hyp.get("anchors")) and not resume else []  # exclude keys
-        csd = ckpt["model"].float().state_dict()  # checkpoint state_dict as FP32
-        csd = intersect_dicts(csd, model.state_dict(), exclude=exclude)  # intersect
-        model.load_state_dict(csd, strict=False)  # load
+        csd = ckpt["model"].float().state_dict()                                    # checkpoint state_dict as FP32
+        csd = intersect_dicts(csd, model.state_dict(), exclude=exclude)             # intersect, map two state_dict in cpmmon parts
+        model.load_state_dict(csd, strict=False)                                    # load with no strict
         LOGGER.info(f"Transferred {len(csd)}/{len(model.state_dict())} items from {weights}")  # report
     else:
         model = Model(cfg, ch=3, nc=nc, anchors=hyp.get("anchors")).to(device)  # create
-    amp = check_amp(model)  # check AMP
+    amp = check_amp(model)  # check AMP , to find Automatic Mixed Precision can be use in model training or not
+    """
+    to compart fp36 inference and fp16/36 inferance bias, if abs bias lower than 10% , return ture
+    """
 
-    # Freeze
+    # ---------------------- Freeze : require grad ture for all, make freeze module params reset to be false ----
     freeze = [f"model.{x}." for x in (freeze if len(freeze) > 1 else range(freeze[0]))]  # layers to freeze
     for k, v in model.named_parameters():
         v.requires_grad = True  # train all layers
@@ -205,29 +210,29 @@ def train(hyp, opt, device, callbacks):
             LOGGER.info(f"freezing {k}")
             v.requires_grad = False
 
-    # Image size
-    gs = max(int(model.stride.max()), 32)  # grid size (max stride)
-    imgsz = check_img_size(opt.imgsz, gs, floor=gs * 2)  # verify imgsz is gs-multiple
+    # Image size ------------ to comfir imgsz can be devided by gs
+    gs = max(int(model.stride.max()), 32)                # grid size (max stride)
+    imgsz = check_img_size(opt.imgsz, gs, floor=gs * 2)  # verify imgsz can be devided by gs
 
-    # Batch size
+    # Batch size ------------- to caculate best batch if not set
     if RANK == -1 and batch_size == -1:  # single-GPU only, estimate best batch size
         batch_size = check_train_batch_size(model, imgsz, amp)
         loggers.on_params_update({"batch_size": batch_size})
 
-    # Optimizer
+    # Optimizer ---------------- accumulate iterations , setup optimizer
     nbs = 64  # nominal batch size
     accumulate = max(round(nbs / batch_size), 1)  # accumulate loss before optimizing
     hyp["weight_decay"] *= batch_size * accumulate / nbs  # scale weight_decay
     optimizer = smart_optimizer(model, opt.optimizer, hyp["lr0"], hyp["momentum"], hyp["weight_decay"])
 
-    # Scheduler
+    # Scheduler ---------------- to setup lr decend rule 
     if opt.cos_lr:
         lf = one_cycle(1, hyp["lrf"], epochs)  # cosine 1->hyp['lrf']
     else:
         lf = lambda x: (1 - x / epochs) * (1.0 - hyp["lrf"]) + hyp["lrf"]  # linear
     scheduler = lr_scheduler.LambdaLR(optimizer, lr_lambda=lf)  # plot_lr_scheduler(optimizer, scheduler, epochs)
 
-    # EMA
+    # EMA  ------------- Exponential Moving Average for weights, to make training stable and quick
     ema = ModelEMA(model) if RANK in {-1, 0} else None
 
     # Resume
@@ -237,7 +242,7 @@ def train(hyp, opt, device, callbacks):
             best_fitness, start_epoch, epochs = smart_resume(ckpt, optimizer, ema, weights, epochs, resume)
         del ckpt, csd
 
-    # DP mode
+    # DP mode ------------------------------ is slower than  torch.distributed.run
     if cuda and RANK == -1 and torch.cuda.device_count() > 1:
         LOGGER.warning(
             "WARNING ⚠️ DP not recommended, use torch.distributed.run for best DDP Multi-GPU results.\n"
@@ -245,11 +250,12 @@ def train(hyp, opt, device, callbacks):
         )
         model = torch.nn.DataParallel(model)
 
-    # SyncBatchNorm
+    # SyncBatchNorm ------------------------ to caculate u and std in all gpu , and then run batchnormalize once
     if opt.sync_bn and cuda and RANK != -1:
         model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model).to(device)
         LOGGER.info("Using SyncBatchNorm()")
-
+        
+    # dataloader -------------------------------------------------------------------------------------------
     # Trainloader
     train_loader, dataset = create_dataloader(
         train_path,
@@ -320,8 +326,9 @@ def train(hyp, opt, device, callbacks):
     last_opt_step = -1
     maps = np.zeros(nc)  # mAP per class
     results = (0, 0, 0, 0, 0, 0, 0)  # P, R, mAP@.5, mAP@.5-.95, val_loss(box, obj, cls)
-    scheduler.last_epoch = start_epoch - 1  # do not move
-    scaler = torch.cuda.amp.GradScaler(enabled=amp)
+    scheduler.last_epoch = start_epoch - 1              # do not move
+    scaler = torch.cuda.amp.GradScaler(enabled=amp)     # to adjust grad in optimizer in amp to low memry and accelerate
+    
     stopper, stop = EarlyStopping(patience=opt.patience), False
     compute_loss = ComputeLoss(model)  # init loss class
     callbacks.run("on_train_start")
@@ -331,7 +338,9 @@ def train(hyp, opt, device, callbacks):
         f"Logging results to {colorstr('bold', save_dir)}\n"
         f'Starting training for {epochs} epochs...'
     )
-    for epoch in range(start_epoch, epochs):  # epoch ------------------------------------------------------------------
+    
+    # epoch star  ------------------------------------------------------------------
+    for epoch in range(start_epoch, epochs):  
         callbacks.run("on_train_epoch_start")
         model.train()
 
@@ -352,13 +361,15 @@ def train(hyp, opt, device, callbacks):
         LOGGER.info(("\n" + "%11s" * 7) % ("Epoch", "GPU_mem", "box_loss", "obj_loss", "cls_loss", "Instances", "Size"))
         if RANK in {-1, 0}:
             pbar = tqdm(pbar, total=nb, bar_format=TQDM_BAR_FORMAT)  # progress bar
+            
         optimizer.zero_grad()
-        for i, (imgs, targets, paths, _) in pbar:  # batch -------------------------------------------------------------
+        for i, (imgs, targets, paths, _) in pbar:
+            # batch star -------------------------------------------------------------
             callbacks.run("on_train_batch_start")
             ni = i + nb * epoch  # number integrated batches (since train start)
             imgs = imgs.to(device, non_blocking=True).float() / 255  # uint8 to float32, 0-255 to 0.0-1.0
 
-            # Warmup
+            # Warmup -----at begging to setup lower lr make train stable while use a large lr and avoid grad problem ----------------------------
             if ni <= nw:
                 xi = [0, nw]  # x interp
                 # compute_loss.gr = np.interp(ni, xi, [0.0, 1.0])  # iou loss ratio (obj_loss = 1.0 or iou)
@@ -369,7 +380,7 @@ def train(hyp, opt, device, callbacks):
                     if "momentum" in x:
                         x["momentum"] = np.interp(ni, xi, [hyp["warmup_momentum"], hyp["momentum"]])
 
-            # Multi-scale
+            # Multi-scale -----train stratage --------------------------------------------------------------------------
             if opt.multi_scale:
                 sz = random.randrange(int(imgsz * 0.5), int(imgsz * 1.5) + gs) // gs * gs  # size
                 sf = sz / max(imgs.shape[2:])  # scale factor
@@ -377,24 +388,26 @@ def train(hyp, opt, device, callbacks):
                     ns = [math.ceil(x * sf / gs) * gs for x in imgs.shape[2:]]  # new shape (stretched to gs-multiple)
                     imgs = nn.functional.interpolate(imgs, size=ns, mode="bilinear", align_corners=False)
 
-            # Forward
+            # Forward -- get loss and upscale with WORLD_SIZE
             with torch.cuda.amp.autocast(amp):
                 pred = model(imgs)  # forward
                 loss, loss_items = compute_loss(pred, targets.to(device))  # loss scaled by batch_size
                 if RANK != -1:
-                    loss *= WORLD_SIZE  # gradient averaged between devices in DDP mode
+                    loss *= WORLD_SIZE    # gradient averaged between devices in DDP mode; for all-reduce opt to keep grad val when backward
                 if opt.quad:
                     loss *= 4.0
 
             # Backward
-            scaler.scale(loss).backward()
+            scaler.scale(loss).backward()   # for amp to process loss before backward
 
             # Optimize - https://pytorch.org/docs/master/notes/amp_examples.html
+            # grad accumulate before backward ---------- decread backward resource
             if ni - last_opt_step >= accumulate:
-                scaler.unscale_(optimizer)  # unscale gradients
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=10.0)  # clip gradients
-                scaler.step(optimizer)  # optimizer.step
-                scaler.update()
+                scaler.unscale_(optimizer)                      # unscale gradients, refresh new grad in optimeizer 
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 
+                                               max_norm=10.0)  # clip gradients to aviod grad explosion
+                scaler.step(optimizer)  # is same as optimizer.step() , depend on version of torch
+                scaler.update()         # update scael fractor according to nowday and record
                 optimizer.zero_grad()
                 if ema:
                     ema.update(model)
@@ -445,7 +458,7 @@ def train(hyp, opt, device, callbacks):
             log_vals = list(mloss) + list(results) + lr
             callbacks.run("on_fit_epoch_end", log_vals, epoch, best_fitness, fi)
 
-            # Save model
+            # Save model ---- save model , ema_model , optimiazer , opt params
             if (not nosave) or (final_epoch and not evolve):  # if save
                 ckpt = {
                     "epoch": epoch,
@@ -476,8 +489,6 @@ def train(hyp, opt, device, callbacks):
                 stop = broadcast_list[0]
         if stop:
             break  # must break all DDP ranks
-
-        # end epoch ----------------------------------------------------------------------------------------------------
     # end training -----------------------------------------------------------------------------------------------------
     if RANK in {-1, 0}:
         LOGGER.info(f"\n{epoch - start_epoch + 1} epochs completed in {(time.time() - t0) / 3600:.3f} hours.")
@@ -510,59 +521,59 @@ def train(hyp, opt, device, callbacks):
     return results
 
 
-def parse_opt(known=False):
-    """Parses command-line arguments for YOLOv5 training, validation, and testing."""
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--weights", type=str, default=ROOT / "yolov5s.pt", help="initial weights path")
-    parser.add_argument("--cfg", type=str, default="", help="model.yaml path")
-    parser.add_argument("--data", type=str, default=ROOT / "data/coco128.yaml", help="dataset.yaml path")
-    parser.add_argument("--hyp", type=str, default=ROOT / "data/hyps/hyp.scratch-low.yaml", help="hyperparameters path")
-    parser.add_argument("--epochs", type=int, default=100, help="total training epochs")
-    parser.add_argument("--batch-size", type=int, default=16, help="total batch size for all GPUs, -1 for autobatch")
-    parser.add_argument("--imgsz", "--img", "--img-size", type=int, default=640, help="train, val image size (pixels)")
-    parser.add_argument("--rect", action="store_true", help="rectangular training")
-    parser.add_argument("--resume", nargs="?", const=True, default=False, help="resume most recent training")
-    parser.add_argument("--nosave", action="store_true", help="only save final checkpoint")
-    parser.add_argument("--noval", action="store_true", help="only validate final epoch")
-    parser.add_argument("--noautoanchor", action="store_true", help="disable AutoAnchor")
-    parser.add_argument("--noplots", action="store_true", help="save no plot files")
-    parser.add_argument("--evolve", type=int, nargs="?", const=300, help="evolve hyperparameters for x generations")
-    parser.add_argument(
-        "--evolve_population", type=str, default=ROOT / "data/hyps", help="location for loading population"
-    )
-    parser.add_argument("--resume_evolve", type=str, default=None, help="resume evolve from last generation")
-    parser.add_argument("--bucket", type=str, default="", help="gsutil bucket")
-    parser.add_argument("--cache", type=str, nargs="?", const="ram", help="image --cache ram/disk")
-    parser.add_argument("--image-weights", action="store_true", help="use weighted image selection for training")
-    parser.add_argument("--device", default="", help="cuda device, i.e. 0 or 0,1,2,3 or cpu")
-    parser.add_argument("--multi-scale", action="store_true", help="vary img-size +/- 50%%")
-    parser.add_argument("--single-cls", action="store_true", help="train multi-class data as single-class")
-    parser.add_argument("--optimizer", type=str, choices=["SGD", "Adam", "AdamW"], default="SGD", help="optimizer")
-    parser.add_argument("--sync-bn", action="store_true", help="use SyncBatchNorm, only available in DDP mode")
-    parser.add_argument("--workers", type=int, default=8, help="max dataloader workers (per RANK in DDP mode)")
-    parser.add_argument("--project", default=ROOT / "runs/train", help="save to project/name")
-    parser.add_argument("--name", default="exp", help="save to project/name")
-    parser.add_argument("--exist-ok", action="store_true", help="existing project/name ok, do not increment")
-    parser.add_argument("--quad", action="store_true", help="quad dataloader")
-    parser.add_argument("--cos-lr", action="store_true", help="cosine LR scheduler")
-    parser.add_argument("--label-smoothing", type=float, default=0.0, help="Label smoothing epsilon")
-    parser.add_argument("--patience", type=int, default=100, help="EarlyStopping patience (epochs without improvement)")
-    parser.add_argument("--freeze", nargs="+", type=int, default=[0], help="Freeze layers: backbone=10, first3=0 1 2")
-    parser.add_argument("--save-period", type=int, default=-1, help="Save checkpoint every x epochs (disabled if < 1)")
-    parser.add_argument("--seed", type=int, default=0, help="Global training seed")
-    parser.add_argument("--local_rank", type=int, default=-1, help="Automatic DDP Multi-GPU argument, do not modify")
+# def parse_opt(known=False):
+#     """Parses command-line arguments for YOLOv5 training, validation, and testing."""
+#     parser = argparse.ArgumentParser()
+#     parser.add_argument("--weights", type=str, default=ROOT / "yolov5s.pt", help="initial weights path")
+#     parser.add_argument("--cfg", type=str, default="", help="model.yaml path")
+#     parser.add_argument("--data", type=str, default=ROOT / "data/coco128.yaml", help="dataset.yaml path")
+#     parser.add_argument("--hyp", type=str, default=ROOT / "data/hyps/hyp.scratch-low.yaml", help="hyperparameters path")
+#     parser.add_argument("--epochs", type=int, default=100, help="total training epochs")
+#     parser.add_argument("--batch-size", type=int, default=16, help="total batch size for all GPUs, -1 for autobatch")
+#     parser.add_argument("--imgsz", "--img", "--img-size", type=int, default=640, help="train, val image size (pixels)")
+#     parser.add_argument("--rect", action="store_true", help="rectangular training")
+#     parser.add_argument("--resume", nargs="?", const=True, default=False, help="resume most recent training")
+#     parser.add_argument("--nosave", action="store_true", help="only save final checkpoint")
+#     parser.add_argument("--noval", action="store_true", help="only validate final epoch")
+#     parser.add_argument("--noautoanchor", action="store_true", help="disable AutoAnchor")
+#     parser.add_argument("--noplots", action="store_true", help="save no plot files")
+#     parser.add_argument("--evolve", type=int, nargs="?", const=300, help="evolve hyperparameters for x generations")
+#     parser.add_argument(
+#         "--evolve_population", type=str, default=ROOT / "data/hyps", help="location for loading population"
+#     )
+#     parser.add_argument("--resume_evolve", type=str, default=None, help="resume evolve from last generation")
+#     parser.add_argument("--bucket", type=str, default="", help="gsutil bucket")
+#     parser.add_argument("--cache", type=str, nargs="?", const="ram", help="image --cache ram/disk")
+#     parser.add_argument("--image-weights", action="store_true", help="use weighted image selection for training")
+#     parser.add_argument("--device", default="", help="cuda device, i.e. 0 or 0,1,2,3 or cpu")
+#     parser.add_argument("--multi-scale", action="store_true", help="vary img-size +/- 50%%")
+#     parser.add_argument("--single-cls", action="store_true", help="train multi-class data as single-class")
+#     parser.add_argument("--optimizer", type=str, choices=["SGD", "Adam", "AdamW"], default="SGD", help="optimizer")
+#     parser.add_argument("--sync-bn", action="store_true", help="use SyncBatchNorm, only available in DDP mode")
+#     parser.add_argument("--workers", type=int, default=8, help="max dataloader workers (per RANK in DDP mode)")
+#     parser.add_argument("--project", default=ROOT / "runs/train", help="save to project/name")
+#     parser.add_argument("--name", default="exp", help="save to project/name")
+#     parser.add_argument("--exist-ok", action="store_true", help="existing project/name ok, do not increment")
+#     parser.add_argument("--quad", action="store_true", help="quad dataloader")
+#     parser.add_argument("--cos-lr", action="store_true", help="cosine LR scheduler")
+#     parser.add_argument("--label-smoothing", type=float, default=0.0, help="Label smoothing epsilon")
+#     parser.add_argument("--patience", type=int, default=100, help="EarlyStopping patience (epochs without improvement)")
+#     parser.add_argument("--freeze", nargs="+", type=int, default=[0], help="Freeze layers: backbone=10, first3=0 1 2")
+#     parser.add_argument("--save-period", type=int, default=-1, help="Save checkpoint every x epochs (disabled if < 1)")
+#     parser.add_argument("--seed", type=int, default=0, help="Global training seed")
+#     parser.add_argument("--local_rank", type=int, default=-1, help="Automatic DDP Multi-GPU argument, do not modify")
 
-    # Logger arguments
-    parser.add_argument("--entity", default=None, help="Entity")
-    parser.add_argument("--upload_dataset", nargs="?", const=True, default=False, help='Upload data, "val" option')
-    parser.add_argument("--bbox_interval", type=int, default=-1, help="Set bounding-box image logging interval")
-    parser.add_argument("--artifact_alias", type=str, default="latest", help="Version of dataset artifact to use")
+#     # Logger arguments
+#     parser.add_argument("--entity", default=None, help="Entity")
+#     parser.add_argument("--upload_dataset", nargs="?", const=True, default=False, help='Upload data, "val" option')
+#     parser.add_argument("--bbox_interval", type=int, default=-1, help="Set bounding-box image logging interval")
+#     parser.add_argument("--artifact_alias", type=str, default="latest", help="Version of dataset artifact to use")
 
-    # NDJSON logging
-    parser.add_argument("--ndjson-console", action="store_true", help="Log ndjson to console")
-    parser.add_argument("--ndjson-file", action="store_true", help="Log ndjson to file")
+#     # NDJSON logging
+#     parser.add_argument("--ndjson-console", action="store_true", help="Log ndjson to console")
+#     parser.add_argument("--ndjson-file", action="store_true", help="Log ndjson to file")
 
-    return parser.parse_known_args()[0] if known else parser.parse_args()
+#     return parser.parse_known_args()[0] if known else parser.parse_args()
 
 
 def main(opt, callbacks=Callbacks()):
@@ -827,8 +838,8 @@ def generate_individual(input_ranges, individual_length):
     for i in range(individual_length):
         lower_bound, upper_bound = input_ranges[i]
         individual.append(random.uniform(lower_bound, upper_bound))
-    return individual
 
+    return individual
 
 def run(**kwargs):
     """
@@ -844,5 +855,61 @@ def run(**kwargs):
 
 
 if __name__ == "__main__":
+    
+    def parse_opt(known=False):
+        """Parses command-line arguments for YOLOv5 training, validation, and testing."""
+        parser = argparse.ArgumentParser()
+        parser.add_argument("--weights", type=str, default=ROOT / "chkpt/yolov5s.pt", help="initial weights path")
+        parser.add_argument("--cfg", type=str, default="/highres_new/high_res/project/data_process/0_lora/yolov5/models/yolov5s.yaml", help="model.yaml path")
+        parser.add_argument("--data", type=str, default=ROOT / "data/coco.yaml", help="dataset.yaml path")
+        parser.add_argument("--hyp", type=str, default=ROOT / "data/hyps/hyp.scratch-low.yaml", help="hyperparameters path")
+        parser.add_argument("--epochs", type=int, default=100, help="total training epochs")
+        parser.add_argument("--batch-size", type=int, default=4, help="total batch size for all GPUs, -1 for autobatch")
+        parser.add_argument("--imgsz", "--img", "--img-size", type=int, default=640, help="train, val image size (pixels)")
+        parser.add_argument("--rect", action="store_true", help="rectangular training")
+        parser.add_argument("--resume", nargs="?", const=True, default=False, help="resume most recent training")
+        parser.add_argument("--nosave", action="store_true", help="only save final checkpoint")
+        parser.add_argument("--noval", action="store_true", help="only validate final epoch")
+        parser.add_argument("--noautoanchor", action="store_true", help="disable AutoAnchor")
+        parser.add_argument("--noplots", action="store_true", help="save no plot files")
+        parser.add_argument("--evolve", type=int, nargs="?", const=300, help="evolve hyperparameters for x generations")
+        parser.add_argument(
+            "--evolve_population", type=str, default=ROOT / "data/hyps", help="location for loading population"
+        )
+        parser.add_argument("--resume_evolve", type=str, default=None, help="resume evolve from last generation")
+        parser.add_argument("--bucket", type=str, default="", help="gsutil bucket")
+        parser.add_argument("--cache", type=str, nargs="?", const="ram", help="image --cache ram/disk")
+        parser.add_argument("--image-weights", action="store_true", help="use weighted image selection for training")
+        parser.add_argument("--device", default="cpu", help="cuda device, i.e. 0 or 0,1,2,3 or cpu")
+        parser.add_argument("--multi-scale", action="store_true", help="vary img-size +/- 50%%")
+        parser.add_argument("--single-cls", action="store_true", help="train multi-class data as single-class")
+        parser.add_argument("--optimizer", type=str, choices=["SGD", "Adam", "AdamW"], default="SGD", help="optimizer")
+        parser.add_argument("--sync-bn", action="store_true", help="use SyncBatchNorm, only available in DDP mode")
+        parser.add_argument("--workers", type=int, default=8, help="max dataloader workers (per RANK in DDP mode)")
+        parser.add_argument("--project", default=ROOT / "runs/train", help="save to project/name")
+        parser.add_argument("--name", default="exp", help="save to project/name")
+        parser.add_argument("--exist-ok", action="store_true", help="existing project/name ok, do not increment")
+        parser.add_argument("--quad", action="store_true", help="quad dataloader")
+        parser.add_argument("--cos-lr", action="store_true", help="cosine LR scheduler")
+        parser.add_argument("--label-smoothing", type=float, default=0.0, help="Label smoothing epsilon")
+        parser.add_argument("--patience", type=int, default=100, help="EarlyStopping patience (epochs without improvement)")
+        parser.add_argument("--freeze", nargs="+", type=int, default=[0], help="Freeze layers: backbone=10, first3=0 1 2")
+        parser.add_argument("--save-period", type=int, default=-1, help="Save checkpoint every x epochs (disabled if < 1)")
+        parser.add_argument("--seed", type=int, default=0, help="Global training seed")
+        parser.add_argument("--local_rank", type=int, default=-1, help="Automatic DDP Multi-GPU argument, do not modify")
+
+        # Logger arguments
+        parser.add_argument("--entity", default=None, help="Entity")
+        parser.add_argument("--upload_dataset", nargs="?", const=True, default=False, help='Upload data, "val" option')
+        parser.add_argument("--bbox_interval", type=int, default=-1, help="Set bounding-box image logging interval")
+        parser.add_argument("--artifact_alias", type=str, default="latest", help="Version of dataset artifact to use")
+
+        # NDJSON logging
+        parser.add_argument("--ndjson-console", action="store_true", help="Log ndjson to console")
+        parser.add_argument("--ndjson-file", action="store_true", help="Log ndjson to file")
+
+        return parser.parse_known_args()[0] if known else parser.parse_args()
+        
+    
     opt = parse_opt()
     main(opt)

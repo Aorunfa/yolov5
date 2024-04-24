@@ -82,8 +82,10 @@ class Detect(nn.Module):
         self.no = nc + 5  # number of outputs per anchor
         self.nl = len(anchors)  # number of detection layers
         self.na = len(anchors[0]) // 2  # number of anchors
+
         self.grid = [torch.empty(0) for _ in range(self.nl)]  # init grid
         self.anchor_grid = [torch.empty(0) for _ in range(self.nl)]  # init anchor grid
+        
         self.register_buffer("anchors", torch.tensor(anchors).float().view(self.nl, -1, 2))  # shape(nl,na,2)
         self.m = nn.ModuleList(nn.Conv2d(x, self.no * self.na, 1) for x in ch)  # output conv
         self.inplace = inplace  # use inplace ops (e.g. slice assignment)
@@ -94,9 +96,9 @@ class Detect(nn.Module):
         for i in range(self.nl):
             x[i] = self.m[i](x[i])  # conv
             bs, _, ny, nx = x[i].shape  # x(bs,255,20,20) to x(bs,3,20,20,85)
-            x[i] = x[i].view(bs, self.na, self.no, ny, nx).permute(0, 1, 3, 4, 2).contiguous()
+            x[i] = x[i].view(bs, self.na, self.no, ny, nx).permute(0, 1, 3, 4, 2).contiguous()  # 连续内存 矩阵乘法更高效
 
-            if not self.training:  # inference
+            if not self.training:  # inference : post processs
                 if self.dynamic or self.grid[i].shape[2:4] != x[i].shape[2:4]:
                     self.grid[i], self.anchor_grid[i] = self._make_grid(nx, ny, i)
 
@@ -445,9 +447,11 @@ def parse_model(d, ch):
         LOGGER.info(f"{i:>3}{str(f):>18}{n_:>3}{np:10.0f}  {t:<40}{str(args):<30}")  # print
         save.extend(x % i for x in ([f] if isinstance(f, int) else f) if x != -1)  # append to savelist
         layers.append(m_)
+        
         if i == 0:
             ch = []
         ch.append(c2)
+        
     return nn.Sequential(*layers), sorted(save)
 
 
@@ -468,19 +472,19 @@ if __name__ == "__main__":
     im = torch.rand(opt.batch_size, 3, 640, 640).to(device)
     model = Model(opt.cfg).to(device)
 
-    # Options
-    if opt.line_profile:  # profile layer by layer
-        model(im, profile=True)
+    # # Options
+    # if opt.line_profile:  # profile layer by layer
+    #     model(im, profile=True)
 
-    elif opt.profile:  # profile forward-backward
-        results = profile(input=im, ops=[model], n=3)
+    # elif opt.profile:  # profile forward-backward
+    #     results = profile(input=im, ops=[model], n=3)
 
-    elif opt.test:  # test all models
-        for cfg in Path(ROOT / "models").rglob("yolo*.yaml"):
-            try:
-                _ = Model(cfg)
-            except Exception as e:
-                print(f"Error in {cfg}: {e}")
+    # elif opt.test:  # test all models
+    #     for cfg in Path(ROOT / "models").rglob("yolo*.yaml"):
+    #         try:
+    #             _ = Model(cfg)
+    #         except Exception as e:
+    #             print(f"Error in {cfg}: {e}")
 
-    else:  # report fused model summary
-        model.fuse()
+    # else:  # report fused model summary
+    #     model.fuse()
