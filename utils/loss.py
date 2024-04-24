@@ -7,11 +7,13 @@ import torch.nn as nn
 from utils.metrics import bbox_iou
 from utils.torch_utils import de_parallel
 
-
 def smooth_BCE(eps=0.1):
     """Returns label smoothing BCE targets for reducing overfitting; pos: `1.0 - 0.5*eps`, neg: `0.5*eps`. For details see https://github.com/ultralytics/yolov3/issues/238#issuecomment-598028441"""
+    """
+    减小出现的正样本权重 增加负样本权重
+    不过多关注数量多的类别 提高泛化能力
+    """
     return 1.0 - 0.5 * eps, 0.5 * eps
-
 
 class BCEBlurWithLogitsLoss(nn.Module):
     # BCEwithLogitLoss() with reduced missing label effects.
@@ -144,31 +146,42 @@ class ComputeLoss:
         for i, pi in enumerate(p):
 
             b, a, gj, gi = indices[i]  # image, anchor, gridy, gridx
-            tobj = torch.zeros(pi.shape[:4], dtype=pi.dtype, device=self.device)  # target obj
+            tobj = torch.zeros(pi.shape[:4], dtype=pi.dtype, device=self.device)  # target obj, posive and negative should be condsider
 
             n = b.shape[0]  # number of targets
             if n:
                 # pxy, pwh, _, pcls = pi[b, a, gj, gi].tensor_split((2, 4, 5), dim=1)  # faster, requires torch 1.8.0
-                pxy, pwh, _, pcls = pi[b, a, gj, gi].split((2, 2, 1, self.nc), 1)  # target-subset of predictions
+                pxy, pwh, _, pcls = pi[b, a, gj, gi].split((2, 2, 1, self.nc), 1)  # target-subset of predictions // pi[b, a, gj, gi] shape(n , 85)
 
                 # Regression - box
-                pxy = pxy.sigmoid() * 2 - 0.5
-                pwh = (pwh.sigmoid() * 2) ** 2 * anchors[i]
+                """
+                bbox: [cx, cy, w , h]
+                cxy: 相对gride cell 左上顶点偏移量
+                wh: 绝对宽高, r_wh * ancher_wh
+                以上可以确定两个边框归一化位置和绝对形状
+                """
+                pxy = pxy.sigmoid() * 2 - 0.5  # 中心点相对左上角偏移量 
+                pwh = (pwh.sigmoid() * 2) ** 2 * anchors[i] # renew wh according to anchors
                 pbox = torch.cat((pxy, pwh), 1)  # predicted box
                 iou = bbox_iou(pbox, tbox[i], CIoU=True).squeeze()  # iou(prediction, target)
                 lbox += (1.0 - iou).mean()  # iou loss
 
                 # Objectness
-                iou = iou.detach().clamp(0).type(tobj.dtype)
+                """
+                使用iou作为样本前景置信度:
+                pre_box非完全与ture重合, 存在背景像素
+                若使用1作为置信度标签不够准确, iou 可以提高前景背景的区分度
+                """
+                iou = iou.detach().clamp(0).type(tobj.dtype) # detach() no need for grad, only get data val
                 if self.sort_obj_iou:
                     j = iou.argsort()
                     b, a, gj, gi, iou = b[j], a[j], gj[j], gi[j], iou[j]
-                if self.gr < 1: # object rate with iou
+                if self.gr < 1: # rolling 1 with iou 
                     iou = (1.0 - self.gr) + self.gr * iou
-                tobj[b, a, gj, gi] = iou  # iou ratio
+                tobj[b, a, gj, gi] = iou 
 
                 # Classification
-                if self.nc > 1: # cls loss (only if multiple classes)
+                if self.nc > 1: # cls loss
                     t = torch.full_like(pcls, self.cn, device=self.device)  # targets, init with negative sample weights
                     t[range(n), tcls[i]] = self.cp
                     lcls += self.BCEcls(pcls, t)  # BCE
@@ -178,7 +191,7 @@ class ComputeLoss:
                 #     [file.write('%11.5g ' * 4 % tuple(x) + '\n') for x in torch.cat((txy[i], twh[i]), 1)]
 
             obji = self.BCEobj(pi[..., 4], tobj) # a anchor -  cx cy w h conf class-80
-            lobj += obji * self.balance[i]  # obj loss -- 放大小样本和大样本的置信度权重
+            lobj += obji * self.balance[i]  # obj loss get weights by different detect layer -- 放大小样本和大样本的置信度权重
             if self.autobalance:
                 self.balance[i] = self.balance[i] * 0.9999 + 0.0001 / obji.detach().item()
 
@@ -211,7 +224,6 @@ class ComputeLoss:
                     [0, 1],
                     [-1, 0],
                     [0, -1],  # j,k,l,m
-                    # [1, 1], [1, -1], [-1, 1], [-1, -1],  # jk,jm,lk,lm
                 ],
                 device=self.device,
             ).float()
@@ -250,8 +262,8 @@ class ComputeLoss:
                 x % 1 < g and x > 1, to find right-offset idx (y up-offset)     
                 """  
                 j = torch.stack((torch.ones_like(l), l, d, r, u))  #shape [5, nt] ; torch.ones_like(j) all True like j ; torch.stack add axis in first            
-                t = t.repeat((5, 1, 1))[j] # repeat : [[.] [.] [.] [.] [.] ] shape(5, nt, 7)
-                offsets = (torch.zeros_like(gxy)[None] + off[:, None])[j] # boasdert as t
+                t = t.repeat((5, 1, 1))[j] # repeat : [[.i] [.l] [.d] [.r] [.u] ] shape(5, nt, 7) ; filter by j [offset_n, 7] 
+                offsets = (torch.zeros_like(gxy)[None] + off[:, None])[j] # boasdert as t, to make responsive offset
             else:
                 t = targets[0]
                 offsets = 0
@@ -259,13 +271,18 @@ class ComputeLoss:
             # Define --- to split each label
             bc, gxy, gwh, a = t.chunk(4, 1)  # (image, class), grid xy, grid wh, anchors
             a, (b, c) = a.long().view(-1), bc.long().T  # anchors, image, class --- 1d 
-            gij = (gxy - offsets).long() # only keep int val, gij is the cell's left-top points
+            gij = (gxy - offsets).long() # only keep int val, gij is the cell's left-top points ----- detail
             gi, gj = gij.T  # grid indices
 
             # Append
             indices.append((b, a, gj.clamp_(0, shape[2] - 1), gi.clamp_(0, shape[3] - 1)))  # image, anchor, extend grid cx, cy
-            tbox.append(torch.cat((gxy - gij, gwh), 1))  # box // cxcy 相对cell左上角偏移量
+            tbox.append(torch.cat((gxy - gij, gwh), 1))  # box // cxcy 相对cell左上角偏移量 ---- detail
             anch.append(anchors[a])  # anchors
             tcls.append(c)  # class
+            
+            """
+            one target can be pred in different layers if anchor can do (4)
+            yolov8 anchor free
+            """
 
         return tcls, tbox, indices, anch
